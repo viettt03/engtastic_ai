@@ -1,5 +1,5 @@
 # engtastic_ai
-
+```
 import numpy as np
 import pandas as pd
 
@@ -20,10 +20,12 @@ from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
 )
-
+```
 # =========================================================
 # 1. ĐỌC DỮ LIỆU TỪ 4 FILE
 # =========================================================
+
+```
 DATA_DIR = "datasets/"
 
 student_info = pd.read_csv(
@@ -77,11 +79,12 @@ student_ass = pd.read_csv(
         "score",
     ],
 )
-
+```
 # =========================================================
 # 2. CHỌN KHÓA HỌC, TẠO LABEL DROPOUT
 #    (giống notebook: dùng EEE/2014J)
 # =========================================================
+```
 MODULE = "EEE"
 PRESENTATION = "2014J"
 EARLY_DAYS = 100  # lấy dữ liệu 100 ngày đầu (có thể chỉnh 28 / 50 / 150...)
@@ -96,10 +99,11 @@ students["dropout"] = np.where(students["final_result"] == "Withdrawn", 1, 0)
 
 print("Số lượng sinh viên:", len(students))
 print("Tỉ lệ dropout:", students["dropout"].mean())
-
+```
 # =========================================================
 # 3. FEATURE TỪ studentRegistration (thời gian đăng ký)
 # =========================================================
+```
 reg = student_reg[
     (student_reg["code_module"] == MODULE)
     & (student_reg["code_presentation"] == PRESENTATION)
@@ -113,9 +117,12 @@ reg_features = reg_features.rename(columns={"date_registration": "reg_day"})
 # Đăng ký sớm (trước ngày 0) hay muộn
 reg_features["registered_before_start"] = (reg_features["reg_day"] < 0).astype(int)
 
+```
 # =========================================================
 # 4. FEATURE TỪ studentVle (hành vi click theo thời gian)
 # =========================================================
+
+```
 vle = student_vle[
     (student_vle["code_module"] == MODULE)
     & (student_vle["code_presentation"] == PRESENTATION)
@@ -159,9 +166,11 @@ for w in [w1, w2, w3, w4]:
 
 vle_agg = vle_agg.fillna(0)
 
+```
 # =========================================================
 # 5. FEATURE TỪ studentAssessment (điểm số đầu kỳ)
 # =========================================================
+```
 ass = student_ass[
     (student_ass["id_student"].isin(students["id_student"]))
     & (student_ass["date_submitted"] >= 0)
@@ -192,9 +201,11 @@ last_score = (
 ass_agg = ass_agg.merge(last_score, on="id_student", how="left")
 ass_agg = ass_agg.fillna(0)
 
+```
 # =========================================================
 # 6. GHÉP TẤT CẢ FEATURES LẠI
 # =========================================================
+```
 data = (
     students.merge(reg_features, on="id_student", how="left")
     .merge(vle_agg, on="id_student", how="left")
@@ -227,10 +238,11 @@ for col in numeric_cols_to_fill:
 
 print("NaN còn lại:")
 print(data.isna().sum())
-
+```
 # =========================================================
 # 7. CHỌN FEATURE & CHIA TRAIN/TEST
 # =========================================================
+```
 feature_cols_num = [
     "reg_day",
     "registered_before_start",
@@ -274,10 +286,11 @@ X_train, X_test, y_train, y_test = train_test_split(
 
 print("Shape train/test:", X_train.shape, X_test.shape)
 print("Dropout ratio train/test:", y_train.mean(), y_test.mean())
-
+```
 # =========================================================
 # 8. PREPROCESSOR (GIỐNG BẢN TRƯỚC)
 # =========================================================
+```
 numeric_transformer = Pipeline(
     steps=[
         ("scaler", StandardScaler()),
@@ -380,3 +393,4 @@ for name, clf in models.items():
 
 results_df = pd.DataFrame(results).T
 results_df
+```
