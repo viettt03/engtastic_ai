@@ -394,3 +394,55 @@ for name, clf in models.items():
 results_df = pd.DataFrame(results).T
 results_df
 ```
+
+## Triển khai suy luận & tích hợp NestJS
+
+1. **Train & xuất model**: chạy toàn bộ `test3.ipynb` để sinh file `artifacts/dropout_early21.joblib`. File này chứa cả `Pipeline` đã huấn luyện lẫn metadata (danh sách feature, thông tin module/presentation, metric đánh giá).
+2. **Chạy API FastAPI**: script `serve_dropout_model.py` đã sẵn trong repo. Tạo môi trường Python với các gói `fastapi`, `uvicorn`, `pandas`, `scikit-learn`, `joblib`, rồi chạy:
+     ```bash
+     uvicorn serve_dropout_model:app --host 0.0.0.0 --port 8001
+     ```
+     - `GET /health`: trả metadata model để kiểm tra cron.
+     - `POST /predict`: nhận payload dạng
+         ```json
+         {
+             "threshold": 0.5,
+             "students": [
+                 {
+                     "id_student": 12345,
+                     "total_clicks": 250,
+                     "active_days": 12,
+                     "avg_clicks_per_day": 11.9,
+                     "avg_clicks_per_active_day": 20.8,
+                     "clicks_0_7": 80,
+                     "clicks_8_14": 120,
+                     "clicks_15_21": 50,
+                     "num_assessments": 2,
+                     "avg_score": 65,
+                     "max_score": 80,
+                     "min_score": 55,
+                     "score_std": 17.5,
+                     "last_score": 60,
+                     "pass_rate": 0.5,
+                     "reg_day": -14,
+                     "registered_before_start": 1,
+                     "days_since_last_login": 3,
+                     "inactivity_streak": 2,
+                     "gender": "M",
+                     "age_band": "35-44"
+                 }
+             ]
+         }
+         ```
+     - Phản hồi gồm `dropout_probability` và `dropout_prediction` cho từng sinh viên.
+3. **Cron job trong NestJS**:
+     - Tạo service sử dụng `@Cron()` (hoặc `@Interval()`) để gom dữ liệu đầu vào giống schema trên.
+     - Dùng `HttpModule`/`HttpService` của Nest gọi `POST http://<python-host>:8001/predict` và nhận kết quả.
+     - Lưu kết quả vào DB (`student_dropout_scores`) rồi expose endpoint như `GET /dropout-scores/latest` để FE sử dụng.
+     - Nên log response time, retry khi API Python lỗi (có thể dùng Bull queue hoặc `HttpService` retry).
+4. **Triển khai production**:
+     - Đóng gói API Python trong container riêng (ví dụ Docker) để NestJS cron có thể gọi qua mạng nội bộ.
+     - Tạo job CI/CD chạy notebook thành script (`python train_model.py`) để cập nhật model, sau đó redeploy container FastAPI.
+     - Giữ đồng bộ schema feature giữa notebook và backend bằng cách đọc metadata `numeric_features`/`categorical_features` trong file joblib.
+
+Nhờ vậy toàn bộ pipeline ML chạy trong Python, còn NestJS chỉ cần lo scheduling, lưu trữ và phân phối kết quả.
