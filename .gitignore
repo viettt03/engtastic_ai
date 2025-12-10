@@ -1,2 +1,7 @@
 datasets/
 *.csv
+.venv/
+__pycache__/
+*.pyc
+logs/
+.env

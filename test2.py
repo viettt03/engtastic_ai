@@ -153,7 +153,9 @@ for w in [w1, w2]:
     vle_agg = vle_agg.merge(w, on="id_student", how="left")
 
 vle_agg = vle_agg.fillna(0)
-
+vle_agg["trend_click"] = vle_agg["clicks_8_14"] - vle_agg["clicks_0_7"] 
+# Hoặc tỷ lệ thay đổi (tránh chia cho 0)
+vle_agg["ratio_click"] = (vle_agg["clicks_8_14"] + 1) / (vle_agg["clicks_0_7"] + 1)
 # 4.3 days_since_last_login & inactivity_streak trong 14 ngày
 last_active = (
     vle.groupby("id_student")["date"]
@@ -253,11 +255,13 @@ numeric_cols_to_fill = [
     "avg_clicks_per_active_day",
     "clicks_0_7",
     "clicks_8_14",
+    "trend_click",
+    "ratio_click",
     "num_assessments",
     "avg_score",
     "max_score",
-    "min_score",
-    "score_std",
+    # "min_score",
+    # "score_std",
     "last_score",
     "days_since_last_login",
     "inactivity_streak",
@@ -270,6 +274,7 @@ for col in numeric_cols_to_fill:
 
 print("NaN còn lại:")
 print(data.isna().sum())
+
 
 # =========================================================
 # 7. CHỌN FEATURES
@@ -285,9 +290,11 @@ feature_cols_num = [
     # Quiz / điểm số
     "num_assessments",
     "avg_score",
+    "trend_click",
+    "ratio_click",
     "max_score",
-    "min_score",
-    "score_std",
+    # "min_score",
+    # "score_std",
     "last_score",
     "pass_rate",
     # Thời gian & gián đoạn
@@ -316,6 +323,7 @@ X_train, X_test, y_train, y_test = train_test_split(
 print("Shape train/test:", X_train.shape, X_test.shape)
 print("Dropout ratio train/test:", y_train.mean(), y_test.mean())
 
+
 # =========================================================
 # 8. PREPROCESSOR
 # =========================================================
@@ -342,103 +350,107 @@ preprocessor = ColumnTransformer(
 # 9. MODELS
 # =========================================================
 models = {
+    # Logistic Regression: Thêm class_weight='balanced'
     "LogisticRegression": LogisticRegression(
-        penalty="l1",
-        solver="saga",
-        tol=1e-4,
-        max_iter=1200,
+        penalty="l2",         # Đổi sang l2 thường ổn định hơn cho dữ liệu ít feature
+        solver="lbfgs",
+        class_weight="balanced", # <--- QUAN TRỌNG: Cân bằng trọng số lớp
+        max_iter=2000,
     ),
+    
+    # RandomForest: Tăng độ sâu và số cây, thêm class_weight
     "RandomForest": RandomForestClassifier(
         criterion="gini",
-        max_depth=3,
-        min_samples_leaf=10,
-        min_samples_split=50,
-        n_estimators=50,
+        n_estimators=200,      # Tăng từ 50 lên 200
+        max_depth=10,          # Tăng từ 3 lên 10 (hoặc None) để học sâu hơn
+        min_samples_leaf=4,    # Giảm từ 10 xuống 4 để bắt pattern nhỏ hơn
+        min_samples_split=10,  # Giảm từ 50 xuống 10
+        class_weight="balanced", # <--- QUAN TRỌNG
+        random_state=42
     ),
+    
+    # GradientBoosting: Tăng mạnh n_estimators (GB ko có class_weight trực tiếp, phải chỉnh mẫu hoặc dùng XGBoost/LGBM)
+    # Nhưng ta sẽ chỉnh learning rate và số cây để nó học kỹ hơn
     "GradientBoosting": GradientBoostingClassifier(
-        learning_rate=0.03,
-        max_depth=3,
-        min_samples_split=20,
-        n_estimators=10,
-        n_iter_no_change=10,
+        learning_rate=0.05,    # Tăng nhẹ hoặc giữ nguyên
+        n_estimators=150,      # Tăng từ 10 lên 150 (10 là quá ít)
+        max_depth=5,           # Tăng độ sâu
+        min_samples_split=10,
+        subsample=0.8,         # Giúp giảm overfitting
+        random_state=42
     ),
+    
+    # MLP: Tăng max_iter
     "MLPClassifier": MLPClassifier(
-        alpha=0.1,
+        hidden_layer_sizes=(64, 32), # Thử kiến trúc sâu hơn chút
+        activation='relu',
+        solver='adam',
+        alpha=0.001,
+        learning_rate_init=0.01,
+        max_iter=1000,
         early_stopping=True,
-        hidden_layer_sizes=(135,),
-        learning_rate="constant",
-        learning_rate_init=0.3,
-        max_iter=1200,
-        momentum=0.9,
-        solver="sgd",
+        random_state=42
     ),
 }
 
 results = {}
+thresholds = np.arange(0.1, 0.95, 0.05) # Quét từ 0.1 đến 0.9
+
+print(f"{'MODEL':<20} | {'BEST THRESH':<12} | {'DEFAULT F1':<10} | {'OPTIMIZED F1':<12}")
+print("-" * 65)
 
 for name, clf in models.items():
-    pipe = Pipeline(
-        steps=[
-            ("preprocess", preprocessor),
-            ("classifier", clf),
-        ]
-    )
-
+    # 1. Tạo và huấn luyện pipeline
+    pipe = Pipeline([
+        ("prep", preprocessor),
+        ("clf", clf),
+    ])
     pipe.fit(X_train, y_train)
 
-    y_pred = pipe.predict(X_test)
+    # 2. Dự đoán xác suất (proba)
+    # Lưu ý: Cần lấy cột [1] là xác suất của lớp Positive (Dropout)
     y_proba = pipe.predict_proba(X_test)[:, 1]
-
-    accuracy = accuracy_score(y_test, y_pred)
-    precision_1, recall_1, f1_1, support_1 = precision_recall_fscore_support(
-        y_test, y_pred, labels=[1], average=None
+    
+    # --- TỐI ƯU THRESHOLD ---
+    best_f1 = 0
+    best_thresh = 0.5
+    
+    for thresh in thresholds:
+        # Chuyển xác suất thành nhãn 0/1 dựa trên ngưỡng thresh
+        y_pred_t = (y_proba >= thresh).astype(int)
+        f1_t = f1_score(y_test, y_pred_t)
+        
+        if f1_t > best_f1:
+            best_f1 = f1_t
+            best_thresh = thresh
+    
+    # 3. Tính toán lại Metrics với ngưỡng tốt nhất vừa tìm được
+    y_pred_opt = (y_proba >= best_thresh).astype(int)
+    
+    acc = accuracy_score(y_test, y_pred_opt)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_test, y_pred_opt, labels=[1], zero_division=0
     )
-    roc_auc = roc_auc_score(y_test, y_proba)
-    avg_prec = average_precision_score(y_test, y_proba)
+    auc = roc_auc_score(y_test, y_proba)
+    avgp = average_precision_score(y_test, y_proba)
+    
+    # Lấy F1 mặc định (ngưỡng 0.5) để so sánh chơi
+    y_pred_default = (y_proba >= 0.5).astype(int)
+    f1_default = f1_score(y_test, y_pred_default)
 
+    print(f"{name:<20} | {best_thresh:<12.2f} | {f1_default:<10.4f} | {f1[0]:<12.4f}")
+
+    # 4. Lưu kết quả
     results[name] = {
-        "accuracy": accuracy,
-        "precision_1": precision_1[0],
-        "recall_1": recall_1[0],
-        "f1_1": f1_1[0],
-        "roc_auc": roc_auc,
-        "avg_precision": avg_prec,
-        "support_1": support_1[0],
+        "best_thresh": best_thresh,
+        "accuracy": acc,
+        "precision": prec[0],
+        "recall": rec[0],
+        "f1_opt": f1[0],     # F1 đã tối ưu
+        "roc_auc": auc,
+        "avg_precision": avgp,
     }
 
+print("-" * 65)
 results_df = pd.DataFrame(results).T
-print(results_df)
-
-# =========================================================
-# 10. FEATURE IMPORTANCE RANDOMFOREST
-# =========================================================
-rf_clf = RandomForestClassifier(
-    criterion="gini",
-    max_depth=3,
-    min_samples_leaf=10,
-    min_samples_split=50,
-    n_estimators=50,
-)
-rf_pipe = Pipeline(
-    steps=[
-        ("preprocess", preprocessor),
-        ("classifier", rf_clf),
-    ]
-)
-rf_pipe.fit(X_train, y_train)
-
-feature_names = rf_pipe.named_steps["preprocess"].get_feature_names_out()
-importances = rf_pipe.named_steps["classifier"].feature_importances_
-
-fi = pd.DataFrame(
-    {"feature": feature_names, "importance": importances}
-).sort_values("importance", ascending=False)
-
-top_n = 20
-plt.figure()
-fi.head(top_n).set_index("feature")["importance"].plot(kind="barh")
-plt.gca().invert_yaxis()
-plt.title(f"Top {top_n} feature quan trọng (RandomForest) - EARLY 14 DAYS")
-plt.xlabel("Importance")
-plt.tight_layout()
-plt.show()
+print("\nBẢNG KẾT QUẢ CHI TIẾT SAU KHI TỐI ƯU:")

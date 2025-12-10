@@ -12,7 +12,6 @@ import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-
 MODEL_PATH = Path("artifacts/dropout_early21.joblib")
 if not MODEL_PATH.exists():
     raise FileNotFoundError(
