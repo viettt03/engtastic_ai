@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 MODEL_PATH = Path("artifacts/dropout_early21.joblib")
 if not MODEL_PATH.exists():
     raise FileNotFoundError(
-        "Missing trained pipeline artifact. Execute test3.ipynb to produce artifacts/dropout_early21.joblib first."
+        "Missing trained pipeline artifact. Execute main.ipynb to produce artifacts/dropout_early21.joblib first."
     )
 
 artifact = joblib.load(MODEL_PATH)
@@ -36,6 +36,8 @@ class StudentFeatures(BaseModel):
     avg_clicks_per_active_day: float = 0
     clicks_0_7: float = 0
     clicks_8_14: float = 0
+    trend_click: float = 0
+    ratio_click: float = 0
     clicks_15_21: float = 0
     num_assessments: float = 0
     avg_score: float = 0
