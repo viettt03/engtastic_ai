@@ -1,4 +1,5 @@
 # engtastic_ai
+
 ```
 import numpy as np
 import pandas as pd
@@ -21,8 +22,11 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 ```
+
 # =========================================================
+
 # 1. ĐỌC DỮ LIỆU TỪ 4 FILE
+
 # =========================================================
 
 ```
@@ -80,10 +84,15 @@ student_ass = pd.read_csv(
     ],
 )
 ```
+
 # =========================================================
+
 # 2. CHỌN KHÓA HỌC, TẠO LABEL DROPOUT
-#    (giống notebook: dùng EEE/2014J)
+
+# (giống notebook: dùng EEE/2014J)
+
 # =========================================================
+
 ```
 MODULE = "EEE"
 PRESENTATION = "2014J"
@@ -100,9 +109,13 @@ students["dropout"] = np.where(students["final_result"] == "Withdrawn", 1, 0)
 print("Số lượng sinh viên:", len(students))
 print("Tỉ lệ dropout:", students["dropout"].mean())
 ```
+
 # =========================================================
+
 # 3. FEATURE TỪ studentRegistration (thời gian đăng ký)
+
 # =========================================================
+
 ```
 reg = student_reg[
     (student_reg["code_module"] == MODULE)
@@ -118,8 +131,11 @@ reg_features = reg_features.rename(columns={"date_registration": "reg_day"})
 reg_features["registered_before_start"] = (reg_features["reg_day"] < 0).astype(int)
 
 ```
+
 # =========================================================
+
 # 4. FEATURE TỪ studentVle (hành vi click theo thời gian)
+
 # =========================================================
 
 ```
@@ -167,9 +183,13 @@ for w in [w1, w2, w3, w4]:
 vle_agg = vle_agg.fillna(0)
 
 ```
+
 # =========================================================
+
 # 5. FEATURE TỪ studentAssessment (điểm số đầu kỳ)
+
 # =========================================================
+
 ```
 ass = student_ass[
     (student_ass["id_student"].isin(students["id_student"]))
@@ -202,9 +222,13 @@ ass_agg = ass_agg.merge(last_score, on="id_student", how="left")
 ass_agg = ass_agg.fillna(0)
 
 ```
+
 # =========================================================
+
 # 6. GHÉP TẤT CẢ FEATURES LẠI
+
 # =========================================================
+
 ```
 data = (
     students.merge(reg_features, on="id_student", how="left")
@@ -239,9 +263,13 @@ for col in numeric_cols_to_fill:
 print("NaN còn lại:")
 print(data.isna().sum())
 ```
+
 # =========================================================
+
 # 7. CHỌN FEATURE & CHIA TRAIN/TEST
+
 # =========================================================
+
 ```
 feature_cols_num = [
     "reg_day",
@@ -287,9 +315,13 @@ X_train, X_test, y_train, y_test = train_test_split(
 print("Shape train/test:", X_train.shape, X_test.shape)
 print("Dropout ratio train/test:", y_train.mean(), y_test.mean())
 ```
+
 # =========================================================
+
 # 8. PREPROCESSOR (GIỐNG BẢN TRƯỚC)
+
 # =========================================================
+
 ```
 numeric_transformer = Pipeline(
     steps=[
@@ -399,50 +431,54 @@ results_df
 
 1. **Train & xuất model**: chạy toàn bộ `test3.ipynb` để sinh file `artifacts/dropout_early21.joblib`. File này chứa cả `Pipeline` đã huấn luyện lẫn metadata (danh sách feature, thông tin module/presentation, metric đánh giá).
 2. **Chạy API FastAPI**: script `serve_dropout_model.py` đã sẵn trong repo. Tạo môi trường Python với các gói `fastapi`, `uvicorn`, `pandas`, `scikit-learn`, `joblib`, rồi chạy:
-     ```bash
-     uvicorn serve_dropout_model:app --host 0.0.0.0 --port 8001
-     ```
-     - `GET /health`: trả metadata model để kiểm tra cron.
-     - `POST /predict`: nhận payload dạng
-         ```json
+   ```bash
+   uvicorn serve_dropout_model:app --host 0.0.0.0 --port 8001
+   ```
+   - `GET /health`: trả metadata model để kiểm tra cron.
+   - `POST /predict`: nhận payload dạng
+     ```json
+     {
+       "threshold": 0.5,
+       "students": [
          {
-             "threshold": 0.5,
-             "students": [
-                 {
-                     "id_student": 12345,
-                     "total_clicks": 250,
-                     "active_days": 12,
-                     "avg_clicks_per_day": 11.9,
-                     "avg_clicks_per_active_day": 20.8,
-                     "clicks_0_7": 80,
-                     "clicks_8_14": 120,
-                     "clicks_15_21": 50,
-                     "num_assessments": 2,
-                     "avg_score": 65,
-                     "max_score": 80,
-                     "min_score": 55,
-                     "score_std": 17.5,
-                     "last_score": 60,
-                     "pass_rate": 0.5,
-                     "reg_day": -14,
-                     "registered_before_start": 1,
-                     "days_since_last_login": 3,
-                     "inactivity_streak": 2,
-                     "gender": "M",
-                     "age_band": "35-44"
-                 }
-             ]
+           "id_student": 12345,
+           "total_clicks": 250,
+           "active_days": 12,
+           "avg_clicks_per_day": 11.9,
+           "avg_clicks_per_active_day": 20.8,
+           "clicks_0_7": 80,
+           "clicks_8_14": 120,
+           "clicks_15_21": 50,
+           "num_assessments": 2,
+           "avg_score": 65,
+           "max_score": 80,
+           "min_score": 55,
+           "score_std": 17.5,
+           "last_score": 60,
+           "pass_rate": 0.5,
+           "reg_day": -14,
+           "registered_before_start": 1,
+           "days_since_last_login": 3,
+           "inactivity_streak": 2,
+           "gender": "M",
+           "age_band": "35-44"
          }
-         ```
-     - Phản hồi gồm `dropout_probability` và `dropout_prediction` cho từng sinh viên.
+       ]
+     }
+     ```
+   - Phản hồi gồm `dropout_probability` và `dropout_prediction` cho từng sinh viên.
 3. **Cron job trong NestJS**:
-     - Tạo service sử dụng `@Cron()` (hoặc `@Interval()`) để gom dữ liệu đầu vào giống schema trên.
-     - Dùng `HttpModule`/`HttpService` của Nest gọi `POST http://<python-host>:8001/predict` và nhận kết quả.
-     - Lưu kết quả vào DB (`student_dropout_scores`) rồi expose endpoint như `GET /dropout-scores/latest` để FE sử dụng.
-     - Nên log response time, retry khi API Python lỗi (có thể dùng Bull queue hoặc `HttpService` retry).
+   - Tạo service sử dụng `@Cron()` (hoặc `@Interval()`) để gom dữ liệu đầu vào giống schema trên.
+   - Dùng `HttpModule`/`HttpService` của Nest gọi `POST http://<python-host>:8001/predict` và nhận kết quả.
+   - Lưu kết quả vào DB (`student_dropout_scores`) rồi expose endpoint như `GET /dropout-scores/latest` để FE sử dụng.
+   - Nên log response time, retry khi API Python lỗi (có thể dùng Bull queue hoặc `HttpService` retry).
 4. **Triển khai production**:
-     - Đóng gói API Python trong container riêng (ví dụ Docker) để NestJS cron có thể gọi qua mạng nội bộ.
-     - Tạo job CI/CD chạy notebook thành script (`python train_model.py`) để cập nhật model, sau đó redeploy container FastAPI.
-     - Giữ đồng bộ schema feature giữa notebook và backend bằng cách đọc metadata `numeric_features`/`categorical_features` trong file joblib.
+   - Đóng gói API Python trong container riêng (ví dụ Docker) để NestJS cron có thể gọi qua mạng nội bộ.
+   - Tạo job CI/CD chạy notebook thành script (`python train_model.py`) để cập nhật model, sau đó redeploy container FastAPI.
+   - Giữ đồng bộ schema feature giữa notebook và backend bằng cách đọc metadata `numeric_features`/`categorical_features` trong file joblib.
 
 Nhờ vậy toàn bộ pipeline ML chạy trong Python, còn NestJS chỉ cần lo scheduling, lưu trữ và phân phối kết quả.
+
+```
+uvicorn serve_dropout_model:app --reload --port 8001
+```
