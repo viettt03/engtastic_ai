@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  dropout-predictor:
+    image: engtastic-ai-dropout-predictor
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dropout-predictor
+    ports:
+      - '127.0.0.1:8001:8001'  # Chỉ expose trên localhost, nginx sẽ proxy
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - lms
+
+networks:
+  lms:
+    external: true
