@@ -38,8 +38,6 @@ student_info = pd.read_csv(
         "highest_education",
         "imd_band",
         "num_of_prev_attempts",
-        "studied_credits",
-        "disability",
     ],
 )
 
@@ -454,3 +452,35 @@ for name, clf in models.items():
 print("-" * 65)
 results_df = pd.DataFrame(results).T
 print("\nBẢNG KẾT QUẢ CHI TIẾT SAU KHI TỐI ƯU:")
+
+#CÁC HIỂN THỊ FEATURE IMPORTANCE CHO RANDOM FOREST
+rf_clf = RandomForestClassifier(
+    criterion="gini",
+    max_depth=3,
+    min_samples_leaf=10,
+    min_samples_split=50,
+    n_estimators=50,
+)
+rf_pipe = Pipeline(
+    steps=[
+        ("preprocess", preprocessor),
+        ("classifier", rf_clf),
+    ]
+)
+rf_pipe.fit(X_train, y_train)
+
+feature_names = rf_pipe.named_steps["preprocess"].get_feature_names_out()
+importances = rf_pipe.named_steps["classifier"].feature_importances_
+
+fi = pd.DataFrame(
+    {"feature": feature_names, "importance": importances}
+).sort_values("importance", ascending=False)
+
+top_n = 20
+plt.figure()
+fi.head(top_n).set_index("feature")["importance"].plot(kind="barh")
+plt.gca().invert_yaxis()
+plt.title(f"Top {top_n} feature quan trọng (RandomForest) - EARLY 14 DAYS")
+plt.xlabel("Importance")
+plt.tight_layout()
+plt.show()
