@@ -2,455 +2,231 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupKFold
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.neural_network import MLPClassifier
-
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    roc_auc_score,
-    average_precision_score,
-    accuracy_score,
-    precision_recall_fscore_support,
+    classification_report, roc_auc_score, f1_score, precision_recall_fscore_support
 )
 
 # =========================================================
-# 1. ĐỌC DỮ LIỆU
+# 1. CẤU HÌNH & LOAD DỮ LIỆU
 # =========================================================
 DATA_DIR = "datasets/"
+MODULE = "BBB"  # Đổi sang môn Tiếng Anh/Xã hội
+PRESENTATIONS = ["2013B", "2013J"]
 
-student_info = pd.read_csv(
-    DATA_DIR + "studentInfo.csv",
-    usecols=[
-        "id_student",
-        "code_module",
-        "code_presentation",
-        "final_result",
-        "gender",
-        "region",
-        "age_band",
-        "highest_education",
-        "imd_band",
-        "num_of_prev_attempts",
-        "studied_credits",
-        "disability",
-    ],
-)
+# --- CẤU HÌNH THỜI GIAN QUAN TRỌNG ---
+# Model sẽ học dữ liệu tại các mốc thời gian này.
+# Khi chạy Cron Job thực tế, bạn có thể predict ở bất kỳ ngày nào (ví dụ ngày 45), 
+# model sẽ tự nội suy dựa trên những gì đã học ở ngày 30 và 60.
+TIME_CHECKPOINTS = [14, 30, 60, 90, 120, 150, 180, 210] 
 
-student_reg = pd.read_csv(
-    DATA_DIR + "studentRegistration.csv",
-    usecols=[
-        "id_student",
-        "code_module",
-        "code_presentation",
-        "date_registration",
-        "date_unregistration",
-    ],
-)
+print(f"--- ĐANG XỬ LÝ: {MODULE} {PRESENTATIONS} ---")
+print(f"--- TRAINING MODE: TIME-AWARE (Checkpoints: {TIME_CHECKPOINTS}) ---")
 
-student_vle = pd.read_csv(
-    DATA_DIR + "studentVle.csv",
-    usecols=[
-        "id_student",
-        "code_module",
-        "code_presentation",
-        "id_site",
-        "date",
-        "sum_click",
-    ],
-)
-
-student_ass = pd.read_csv(
-    DATA_DIR + "studentAssessment.csv",
-    usecols=[
-        "id_assessment",
-        "id_student",
-        "date_submitted",
-        "is_banked",
-        "score",
-    ],
-)
+student_info = pd.read_csv(DATA_DIR + "studentInfo.csv")
+student_reg = pd.read_csv(DATA_DIR + "studentRegistration.csv")
+student_vle = pd.read_csv(DATA_DIR + "studentVle.csv")
+student_ass = pd.read_csv(DATA_DIR + "studentAssessment.csv")
 
 # =========================================================
-# 2. CHỌN KHÓA HỌC + LABEL DROPOUT
+# 2. LỌC SINH VIÊN (SELF-PACED SIMULATION)
 # =========================================================
-MODULE = "EEE"
-PRESENTATION = "2014J"
-EARLY_DAYS = 21  # <- bản 21 ngày
+# Chỉ lấy người đăng ký đúng hạn (date_registration <= 0) để giả lập môi trường Self-paced
+# Loại bỏ nhiễu từ những người vào muộn phải học đuổi.
+
+reg_filtered = student_reg[
+    (student_reg["code_module"] == MODULE) & 
+    (student_reg["code_presentation"].isin(PRESENTATIONS)) &
+    (student_reg["date_registration"] <= 0) # <--- Lọc người vào muộn
+]
+valid_ids = reg_filtered["id_student"].unique()
 
 students = student_info[
-    (student_info["code_module"] == MODULE)
-    & (student_info["code_presentation"] == PRESENTATION)
+    (student_info["code_module"] == MODULE) & 
+    (student_info["code_presentation"].isin(PRESENTATIONS)) &
+    (student_info["id_student"].isin(valid_ids))
 ].copy()
 
+# Label Dropout
 students["dropout"] = np.where(students["final_result"] == "Withdrawn", 1, 0)
-
-print("Số lượng sinh viên:", len(students))
-print("Tỉ lệ dropout:", students["dropout"].mean())
+print(f"Số lượng sinh viên gốc (Unique Users): {len(students)}")
 
 # =========================================================
-# 3. FEATURE TỪ REGISTRATION
+# 3. DATA AUGMENTATION (TẠO DATASET ĐA THỜI ĐIỂM)
 # =========================================================
-reg = student_reg[
-    (student_reg["code_module"] == MODULE)
-    & (student_reg["code_presentation"] == PRESENTATION)
-    & (student_reg["id_student"].isin(students["id_student"]))
-].copy()
+augmented_data_list = []
 
-reg_features = reg[["id_student", "date_registration"]].copy()
-reg_features = reg_features.rename(columns={"date_registration": "reg_day"})
-reg_features["registered_before_start"] = (reg_features["reg_day"] < 0).astype(int)
-
-# =========================================================
-# 4. FEATURE TỪ VLE (0–21 NGÀY)
-# =========================================================
-vle = student_vle[
-    (student_vle["code_module"] == MODULE)
-    & (student_vle["code_presentation"] == PRESENTATION)
-    & (student_vle["id_student"].isin(students["id_student"]))
-    & (student_vle["date"] >= 0)
-    & (student_vle["date"] <= EARLY_DAYS)
-].copy()
-
-# 4.1 Tổng quan hoạt động
-vle_agg = (
-    vle.groupby("id_student")
-    .agg(
+for cutoff in TIME_CHECKPOINTS:
+    # print(f"... Đang xử lý mốc thời gian: {cutoff} ngày")
+    
+    # 3.1 Cắt dữ liệu VLE (Hành vi) tính đến ngày cutoff
+    vle_snapshot = student_vle[
+        (student_vle["code_module"] == MODULE) &
+        (student_vle["code_presentation"].isin(PRESENTATIONS)) &
+        (student_vle["id_student"].isin(students["id_student"])) &
+        (student_vle["date"] <= cutoff) # <--- Chỉ lấy quá khứ
+    ]
+    
+    # Aggregation VLE
+    vle_agg = vle_snapshot.groupby("id_student").agg(
         total_clicks=("sum_click", "sum"),
         active_days=("date", "nunique"),
-    )
-    .reset_index()
-)
+        last_active=("date", "max")
+    ).reset_index()
+    
+    # Feature Engineering (Tính toán các chỉ số tương đối)
+    vle_agg["days_elapsed_program"] = cutoff # <--- Feature QUAN TRỌNG NHẤT: Báo cho AI biết đang ở ngày nào
+    vle_agg["clicks_per_day"] = vle_agg["total_clicks"] / cutoff
+    vle_agg["active_ratio"] = vle_agg["active_days"] / cutoff
+    vle_agg["days_since_last_active"] = cutoff - vle_agg["last_active"]
+    
+    # Tính Recency (Tuần gần nhất hoạt động thế nào?)
+    recent_clicks = vle_snapshot[vle_snapshot["date"] > (cutoff - 7)].groupby("id_student")["sum_click"].sum().reset_index(name="clicks_last_7_days")
+    vle_agg = vle_agg.merge(recent_clicks, on="id_student", how="left").fillna(0)
 
-vle_agg["avg_clicks_per_day"] = vle_agg["total_clicks"] / EARLY_DAYS
-vle_agg["avg_clicks_per_active_day"] = (
-    vle_agg["total_clicks"] / vle_agg["active_days"].replace(0, np.nan)
-)
-vle_agg["avg_clicks_per_active_day"] = vle_agg["avg_clicks_per_active_day"].fillna(0)
-
-# 4.2 Click theo từng giai đoạn: 0–7, 8–14, 15–21
-def clicks_in_window(df, start_day, end_day, col_name):
-    w = (
-        df[(df["date"] >= start_day) & (df["date"] <= end_day)]
-        .groupby("id_student")["sum_click"]
-        .sum()
-        .reset_index()
-        .rename(columns={"sum_click": col_name})
-    )
-    return w
-
-w1 = clicks_in_window(vle, 0, 7, "clicks_0_7")
-w2 = clicks_in_window(vle, 8, 14, "clicks_8_14")
-w3 = clicks_in_window(vle, 15, EARLY_DAYS, "clicks_15_21")
-
-for w in [w1, w2, w3]:
-    vle_agg = vle_agg.merge(w, on="id_student", how="left")
-
-vle_agg = vle_agg.fillna(0)
-
-# 4.3 days_since_last_login & inactivity_streak trong 21 ngày
-last_active = (
-    vle.groupby("id_student")["date"]
-    .max()
-    .reset_index()
-    .rename(columns={"date": "last_active_day"})
-)
-last_active["days_since_last_login"] = EARLY_DAYS - last_active["last_active_day"]
-
-vle_days = (
-    vle.groupby("id_student")["date"]
-    .apply(lambda x: sorted(x.unique()))
-    .reset_index()
-    .rename(columns={"date": "active_days_list"})
-)
-
-def compute_inactivity_streak(days_list, max_day):
-    if not days_list:
-        return max_day + 1
-    active_set = set(days_list)
-    streak = 0
-    current_day = max_day
-    while current_day >= 0 and current_day not in active_set:
-        streak += 1
-        current_day -= 1
-    return streak
-
-vle_days["inactivity_streak"] = vle_days["active_days_list"].apply(
-    lambda lst: compute_inactivity_streak(lst, EARLY_DAYS)
-)
-
-extra_activity = last_active[["id_student", "days_since_last_login"]].merge(
-    vle_days[["id_student", "inactivity_streak"]], on="id_student", how="outer"
-)
-
-vle_agg = vle_agg.merge(extra_activity, on="id_student", how="left")
-
-# =========================================================
-# 5. FEATURE TỪ ASSESSMENT (0–21 NGÀY)
-# =========================================================
-ass = student_ass[
-    (student_ass["id_student"].isin(students["id_student"]))
-    & (student_ass["date_submitted"] >= 0)
-    & (student_ass["date_submitted"] <= EARLY_DAYS)
-].copy()
-
-ass_agg = (
-    ass.groupby("id_student")
-    .agg(
+    # 3.2 Cắt dữ liệu Assessment (Điểm số) tính đến ngày cutoff
+    ass_snapshot = student_ass[
+        (student_ass["id_student"].isin(students["id_student"])) &
+        (student_ass["date_submitted"] <= cutoff)
+    ]
+    
+    ass_agg = ass_snapshot.groupby("id_student").agg(
         num_assessments=("id_assessment", "nunique"),
         avg_score=("score", "mean"),
-        max_score=("score", "max"),
-        min_score=("score", "min"),
-        score_std=("score", "std"),
-    )
-    .reset_index()
-)
+        pass_count=("score", lambda x: (x >= 40).sum())
+    ).reset_index()
+    
+    # 3.3 Merge snapshot này với thông tin gốc
+    # Lưu ý: Nhãn dropout không đổi, nhưng hành vi thay đổi theo cutoff
+    merged = students[["id_student", "gender", "highest_education", "dropout"]].merge(vle_agg, on="id_student", how="left")
+    merged = merged.merge(ass_agg, on="id_student", how="left")
+    
+    # Điền khuyết cho những người chưa làm gì tính đến cutoff
+    merged["total_clicks"] = merged["total_clicks"].fillna(0)
+    merged["clicks_per_day"] = merged["clicks_per_day"].fillna(0)
+    merged["active_ratio"] = merged["active_ratio"].fillna(0)
+    merged["days_since_last_active"] = merged["days_since_last_active"].fillna(cutoff) # Chưa học bao giờ -> Lười bằng số ngày cutoff
+    merged["clicks_last_7_days"] = merged["clicks_last_7_days"].fillna(0)
+    merged["num_assessments"] = merged["num_assessments"].fillna(0)
+    merged["avg_score"] = merged["avg_score"].fillna(0)
+    merged["pass_count"] = merged["pass_count"].fillna(0)
+    
+    # Quan trọng: Gán lại cột days_elapsed_program (vì merge left có thể sinh NaN nếu user ko có trong vle)
+    merged["days_elapsed_program"] = cutoff
+    
+    augmented_data_list.append(merged)
 
-last_score = (
-    ass.sort_values(["id_student", "date_submitted"])
-    .groupby("id_student")["score"]
-    .last()
-    .reset_index()
-    .rename(columns={"score": "last_score"})
-)
-
-ass_agg = ass_agg.merge(last_score, on="id_student", how="left")
-
-PASS_THRESHOLD = 40
-ass["is_pass"] = (ass["score"] >= PASS_THRESHOLD).astype(int)
-
-pass_rate = (
-    ass.groupby("id_student")["is_pass"]
-    .mean()
-    .reset_index()
-    .rename(columns={"is_pass": "pass_rate"})
-)
-
-ass_agg = ass_agg.merge(pass_rate, on="id_student", how="left")
-ass_agg = ass_agg.fillna(0)
+# Gộp tất cả snapshots lại
+final_df = pd.concat(augmented_data_list, ignore_index=True)
+print(f"Kích thước dataset sau khi Augmentation: {final_df.shape}")
+# (Kích thước sẽ lớn gấp N lần số lượng user gốc)
 
 # =========================================================
-# 6. GHÉP DỮ LIỆU & FILL NaN
-# =========================================================
-data = (
-    students.merge(reg_features, on="id_student", how="left")
-    .merge(vle_agg, on="id_student", how="left")
-    .merge(ass_agg, on="id_student", how="left")
-)
-
-numeric_cols_to_fill = [
-    "reg_day",
-    "registered_before_start",
-    "total_clicks",
-    "active_days",
-    "avg_clicks_per_day",
-    "avg_clicks_per_active_day",
-    "clicks_0_7",
-    "clicks_8_14",
-    "clicks_15_21",
-    "num_assessments",
-    "avg_score",
-    "max_score",
-    "min_score",
-    "score_std",
-    "last_score",
-    "days_since_last_login",
-    "inactivity_streak",
-    "pass_rate",
-]
-
-for col in numeric_cols_to_fill:
-    if col in data.columns:
-        data[col] = data[col].fillna(0)
-
-print("NaN còn lại:")
-print(data.isna().sum())
-
-# =========================================================
-# 7. CHỌN FEATURES
+# 4. CHUẨN BỊ TRAIN (SPLIT THÔNG MINH)
 # =========================================================
 feature_cols_num = [
-    # Hoạt động
-    "total_clicks",
-    "active_days",
-    "avg_clicks_per_day",
-    "avg_clicks_per_active_day",
-    "clicks_0_7",
-    "clicks_8_14",
-    "clicks_15_21",
-    # Quiz / điểm số
-    "num_assessments",
-    "avg_score",
-    "max_score",
-    "min_score",
-    "score_std",
-    "last_score",
-    "pass_rate",
-    # Thời gian & gián đoạn
-    "reg_day",
-    "registered_before_start",
-    "days_since_last_login",
-    "inactivity_streak",
+    "days_elapsed_program", # Feature ngữ cảnh
+    "total_clicks", "clicks_per_day", "active_ratio", 
+    "days_since_last_active", "clicks_last_7_days",
+    "num_assessments", "avg_score", "pass_count"
 ]
+feature_cols_cat = ["gender", "highest_education"]
 
-feature_cols_cat = [
-    "gender",
-    "age_band",
-]
+X = final_df[feature_cols_num + feature_cols_cat]
+y = final_df["dropout"]
+groups = final_df["id_student"] # Để split sao cho 1 user không nằm cả ở train và test
 
-X = data[feature_cols_num + feature_cols_cat]
-y = data["dropout"]
+# Split theo Group (Tránh Data Leakage: Toàn bộ lịch sử của User A chỉ nằm ở Train hoặc Test)
+gkf = GroupKFold(n_splits=5)
+train_idx, test_idx = next(gkf.split(X, y, groups))
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.3,
+X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+print(f"Train size: {len(X_train)}, Test size: {len(X_test)}")
+
+# =========================================================
+# 5. HUẤN LUYỆN MODEL
+# =========================================================
+preprocessor = ColumnTransformer(transformers=[
+    ("num", StandardScaler(), feature_cols_num),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), feature_cols_cat)
+])
+
+# Random Forest mạnh mẽ hơn
+rf_model = RandomForestClassifier(
+    n_estimators=200,
+    max_depth=12,
+    min_samples_leaf=10, # Tăng lên để tránh overfit vì data lặp lại nhiều
+    class_weight="balanced",
     random_state=42,
-    stratify=y,
+    n_jobs=-1
 )
 
-print("EARLY_DAYS:", EARLY_DAYS)
-print("Shape train/test:", X_train.shape, X_test.shape)
-print("Dropout ratio train/test:", y_train.mean(), y_test.mean())
+pipeline = Pipeline(steps=[("prep", preprocessor), ("clf", rf_model)])
+pipeline.fit(X_train, y_train)
 
 # =========================================================
-# 8. PREPROCESSOR
+# 6. ĐÁNH GIÁ & TÌM THRESHOLD
 # =========================================================
-numeric_transformer = Pipeline(
-    steps=[
-        ("scaler", StandardScaler()),
-    ]
-)
+y_proba = pipeline.predict_proba(X_test)[:, 1]
 
-categorical_transformer = Pipeline(
-    steps=[
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
-    ]
-)
+best_f1 = 0
+best_thresh = 0.5
+thresholds = np.arange(0.1, 0.9, 0.05)
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ("num", numeric_transformer, feature_cols_num),
-        ("cat", categorical_transformer, feature_cols_cat),
-    ]
-)
+for t in thresholds:
+    y_pred_t = (y_proba >= t).astype(int)
+    score = f1_score(y_test, y_pred_t)
+    if score > best_f1:
+        best_f1 = score
+        best_thresh = t
 
-# =========================================================
-# 9. MODELS
-# =========================================================
-models = {
-    "LogisticRegression": LogisticRegression(
-        penalty="l1",
-        solver="saga",
-        tol=1e-4,
-        max_iter=1200,
-    ),
-    "RandomForest": RandomForestClassifier(
-        criterion="gini",
-        max_depth=3,
-        min_samples_leaf=10,
-        min_samples_split=50,
-        n_estimators=50,
-    ),
-    "GradientBoosting": GradientBoostingClassifier(
-        learning_rate=0.03,
-        max_depth=3,
-        min_samples_split=20,
-        n_estimators=10,
-        n_iter_no_change=10,
-    ),
-    "MLPClassifier": MLPClassifier(
-        alpha=0.1,
-        early_stopping=True,
-        hidden_layer_sizes=(135,),
-        learning_rate="constant",
-        learning_rate_init=0.3,
-        max_iter=1200,
-        momentum=0.9,
-        solver="sgd",
-    ),
-}
-
-results = {}
-
-for name, clf in models.items():
-    print(f"\n===== EARLY 21 DAYS | Model: {name} =====")
-    pipe = Pipeline(
-        steps=[
-            ("preprocess", preprocessor),
-            ("classifier", clf),
-        ]
-    )
-
-    pipe.fit(X_train, y_train)
-
-    y_pred = pipe.predict(X_test)
-    y_proba = pipe.predict_proba(X_test)[:, 1]
-
-    accuracy = accuracy_score(y_test, y_pred)
-    precision_1, recall_1, f1_1, support_1 = precision_recall_fscore_support(
-        y_test, y_pred, labels=[1], average=None
-    )
-    roc_auc = roc_auc_score(y_test, y_proba)
-    avg_prec = average_precision_score(y_test, y_proba)
-
-    print("Accuracy:", accuracy)
-    print("Precision (class 1):", precision_1[0])
-    print("Recall (class 1):", recall_1[0])
-    print("F1 (class 1):", f1_1[0])
-    print("ROC AUC:", roc_auc)
-    print("Average precision:", avg_prec)
-
-    results[name] = {
-        "accuracy": accuracy,
-        "precision_1": precision_1[0],
-        "recall_1": recall_1[0],
-        "f1_1": f1_1[0],
-        "roc_auc": roc_auc,
-        "avg_precision": avg_prec,
-        "support_1": support_1[0],
-    }
-
-results_df = pd.DataFrame(results).T
-print("\n===== KẾT QUẢ (EARLY 21 DAYS) =====")
-print(results_df)
+print("-" * 50)
+print(f"BEST THRESHOLD: {best_thresh:.2f}")
+print(f"Max F1-Score: {best_f1:.4f}")
+print(f"AUC: {roc_auc_score(y_test, y_proba):.4f}")
 
 # =========================================================
-# 10. FEATURE IMPORTANCE RANDOMFOREST
+# 7. FEATURE IMPORTANCE & VISUALIZATION
 # =========================================================
-rf_clf = RandomForestClassifier(
-    criterion="gini",
-    max_depth=3,
-    min_samples_leaf=10,
-    min_samples_split=50,
-    n_estimators=50,
-)
-rf_pipe = Pipeline(
-    steps=[
-        ("preprocess", preprocessor),
-        ("classifier", rf_clf),
-    ]
-)
-rf_pipe.fit(X_train, y_train)
+feature_names = pipeline.named_steps["prep"].get_feature_names_out()
+clean_names = [name.split('__')[-1] for name in feature_names]
+importances = pipeline.named_steps["clf"].feature_importances_
 
-feature_names = rf_pipe.named_steps["preprocess"].get_feature_names_out()
-importances = rf_pipe.named_steps["classifier"].feature_importances_
+fi_df = pd.DataFrame({"feature": clean_names, "importance": importances})
+fi_df = fi_df.sort_values("importance", ascending=True)
 
-fi = pd.DataFrame(
-    {"feature": feature_names, "importance": importances}
-).sort_values("importance", ascending=False)
-
-top_n = 20
-plt.figure()
-fi.head(top_n).set_index("feature")["importance"].plot(kind="barh")
-plt.gca().invert_yaxis()
-plt.title(f"Top {top_n} feature quan trọng (RandomForest) - EARLY 21 DAYS")
-plt.xlabel("Importance")
+plt.figure(figsize=(10, 8))
+plt.barh(fi_df["feature"], fi_df["importance"], color='teal')
+plt.title(f"Các yếu tố quan trọng (Time-Aware Model - {MODULE})")
+plt.xlabel("Mức độ quan trọng")
 plt.tight_layout()
 plt.show()
+
+# =========================================================
+# 8. MÔ PHỎNG SỬ DỤNG CHO CRON JOB
+# =========================================================
+print("\n--- MÔ PHỎNG DỰ ĐOÁN HÀNG NGÀY ---")
+# Giả sử hôm nay là ngày thứ 45 của User X
+sample_input = pd.DataFrame({
+    "days_elapsed_program": [45],      # QUAN TRỌNG: User đang ở ngày 45
+    "total_clicks": [120],             # Tổng click từ ngày 0->45
+    "clicks_per_day": [120/45],        # Tính ra ~2.6
+    "active_ratio": [10/45],           # Mới học 10 ngày thôi
+    "days_since_last_active": [5],     # 5 ngày rồi chưa vào
+    "clicks_last_7_days": [2],         # Tuần rồi vào click có 2 cái
+    "num_assessments": [1],
+    "avg_score": [80],
+    "pass_count": [1],
+    "gender": ["M"],
+    "highest_education": ["HE Qualification"]
+})
+
+risk_prob = pipeline.predict_proba(sample_input)[:, 1][0]
+prediction = "NGUY CƠ CAO (Gửi Mail)" if risk_prob >= best_thresh else "An toàn"
+print(f"User X (Ngày 45): Xác suất Dropout {risk_prob:.2%} -> {prediction}")

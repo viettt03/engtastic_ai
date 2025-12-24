@@ -18,6 +18,7 @@ from sklearn.metrics import (
     average_precision_score,
     accuracy_score,
     precision_recall_fscore_support,
+    f1_score,
 )
 
 # =========================================================
@@ -80,7 +81,12 @@ student_ass = pd.read_csv(
 # =========================================================
 MODULE = "EEE"
 PRESENTATION = "2014J"
-EARLY_DAYS = 14  # chỉ dùng 14 ngày đầu cho early-warning
+
+# Cửa sổ trượt 14 ngày tính tới CURRENT_DAY (có thể đổi CURRENT_DAY khi chạy cron hằng ngày)
+WINDOW_SIZE = 14
+CURRENT_DAY = 28  # ví dụ: ngày thứ 28 của khóa; cron có thể set bằng ngày hiện tại
+WINDOW_START = max(0, CURRENT_DAY - WINDOW_SIZE + 1)
+WINDOW_END = CURRENT_DAY
 
 students = student_info[
     (student_info["code_module"] == MODULE)
@@ -92,6 +98,7 @@ students["dropout"] = np.where(students["final_result"] == "Withdrawn", 1, 0)
 
 print("Số lượng sinh viên:", len(students))
 print("Tỉ lệ dropout:", students["dropout"].mean())
+print(f"Cửa sổ trượt: {WINDOW_START} -> {WINDOW_END} (size={WINDOW_SIZE})")
 
 # =========================================================
 # 3. FEATURE TỪ REGISTRATION
@@ -113,8 +120,8 @@ vle = student_vle[
     (student_vle["code_module"] == MODULE)
     & (student_vle["code_presentation"] == PRESENTATION)
     & (student_vle["id_student"].isin(students["id_student"]))
-    & (student_vle["date"] >= 0)
-    & (student_vle["date"] <= EARLY_DAYS)
+    & (student_vle["date"] >= WINDOW_START)
+    & (student_vle["date"] <= WINDOW_END)
 ].copy()
 
 # 4.1 Tổng quan hoạt động
@@ -127,7 +134,7 @@ vle_agg = (
     .reset_index()
 )
 
-vle_agg["avg_clicks_per_day"] = vle_agg["total_clicks"] / EARLY_DAYS
+vle_agg["avg_clicks_per_day"] = vle_agg["total_clicks"] / WINDOW_SIZE
 vle_agg["avg_clicks_per_active_day"] = (
     vle_agg["total_clicks"] / vle_agg["active_days"].replace(0, np.nan)
 )
@@ -144,14 +151,17 @@ def clicks_in_window(df, start_day, end_day, col_name):
     )
     return w
 
-w1 = clicks_in_window(vle, 0, 7, "clicks_0_7")
-w2 = clicks_in_window(vle, 8, EARLY_DAYS, "clicks_8_14")
+first_window_end = min(WINDOW_END, WINDOW_START + (WINDOW_SIZE // 2) - 1)
+second_window_start = min(WINDOW_END, first_window_end + 1)
+
+w1 = clicks_in_window(vle, WINDOW_START, first_window_end, "clicks_0_7")
+w2 = clicks_in_window(vle, second_window_start, WINDOW_END, "clicks_8_14")
 
 for w in [w1, w2]:
     vle_agg = vle_agg.merge(w, on="id_student", how="left")
 
 vle_agg = vle_agg.fillna(0)
-vle_agg["trend_click"] = vle_agg["clicks_8_14"] - vle_agg["clicks_0_7"] 
+vle_agg["trend_click"] = vle_agg["clicks_8_14"] - vle_agg["clicks_0_7"]
 # Hoặc tỷ lệ thay đổi (tránh chia cho 0)
 vle_agg["ratio_click"] = (vle_agg["clicks_8_14"] + 1) / (vle_agg["clicks_0_7"] + 1)
 # 4.3 days_since_last_login & inactivity_streak trong 14 ngày
@@ -161,7 +171,7 @@ last_active = (
     .reset_index()
     .rename(columns={"date": "last_active_day"})
 )
-last_active["days_since_last_login"] = EARLY_DAYS - last_active["last_active_day"]
+last_active["days_since_last_login"] = WINDOW_END - last_active["last_active_day"]
 
 vle_days = (
     vle.groupby("id_student")["date"]
@@ -170,19 +180,21 @@ vle_days = (
     .rename(columns={"date": "active_days_list"})
 )
 
-def compute_inactivity_streak(days_list, max_day):
+
+def compute_inactivity_streak(days_list, window_start, window_end):
+    # Đếm chuỗi ngày không hoạt động tính từ window_end lùi về window_start
     if not days_list:
-        return max_day + 1
+        return window_end - window_start + 1
     active_set = set(days_list)
     streak = 0
-    current_day = max_day
-    while current_day >= 0 and current_day not in active_set:
+    current_day = window_end
+    while current_day >= window_start and current_day not in active_set:
         streak += 1
         current_day -= 1
     return streak
 
 vle_days["inactivity_streak"] = vle_days["active_days_list"].apply(
-    lambda lst: compute_inactivity_streak(lst, EARLY_DAYS)
+    lambda lst: compute_inactivity_streak(lst, WINDOW_START, WINDOW_END)
 )
 
 extra_activity = last_active[["id_student", "days_since_last_login"]].merge(
@@ -190,14 +202,16 @@ extra_activity = last_active[["id_student", "days_since_last_login"]].merge(
 )
 
 vle_agg = vle_agg.merge(extra_activity, on="id_student", how="left")
+vle_agg["days_since_last_login"] = vle_agg["days_since_last_login"].fillna(WINDOW_SIZE)
+vle_agg["inactivity_streak"] = vle_agg["inactivity_streak"].fillna(WINDOW_SIZE)
 
 # =========================================================
 # 5. FEATURE TỪ ASSESSMENT (0–14 NGÀY)
 # =========================================================
 ass = student_ass[
     (student_ass["id_student"].isin(students["id_student"]))
-    & (student_ass["date_submitted"] >= 0)
-    & (student_ass["date_submitted"] <= EARLY_DAYS)
+    & (student_ass["date_submitted"] >= WINDOW_START)
+    & (student_ass["date_submitted"] <= WINDOW_END)
 ].copy()
 
 ass_agg = (
@@ -480,7 +494,9 @@ top_n = 20
 plt.figure()
 fi.head(top_n).set_index("feature")["importance"].plot(kind="barh")
 plt.gca().invert_yaxis()
-plt.title(f"Top {top_n} feature quan trọng (RandomForest) - EARLY 14 DAYS")
+plt.title(
+    f"Top {top_n} feature quan trọng (RandomForest) - WINDOW {WINDOW_SIZE} DAYS (sliding)"
+)
 plt.xlabel("Importance")
 plt.tight_layout()
 plt.show()
