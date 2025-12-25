@@ -1,49 +1,44 @@
+"""
+Pipeline dự báo bỏ học cho hệ thống LMS. 
+Được tách hàm để dùng lại cho cron job hằng ngày (không cần notebook).
+"""
+
+import logging
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import joblib
 import numpy as np
 import pandas as pd
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
+from sklearn.model_selection import GroupKFold
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline as SkPipeline
+from sklearn.preprocessing import PowerTransformer
 
-# =========================
+
+# -----------------
 # Config
-# =========================
+# -----------------
 DATA_DIR = "datasets/"
 MODULE = "BBB"
 PRESENTATIONS = ["2013B", "2013J"]
 TIME_CHECKPOINTS = [14, 30, 60, 90, 120, 150, 180, 210]
-
-# window ngắn hạn để bắt “dấu hiệu gần đây”
 WINDOW_DAYS = 14
 HALF_WINDOW = 7
+VAR_THRESH = 0.0  # an toàn cho sản xuất
+MODEL_PATH = "dropout_model_time_aware.pkl"
 
-student_info = pd.read_csv(DATA_DIR + "studentInfo.csv")
-student_reg  = pd.read_csv(DATA_DIR + "studentRegistration.csv")
-student_vle  = pd.read_csv(DATA_DIR + "studentVle.csv")
-student_ass  = pd.read_csv(DATA_DIR + "studentAssessment.csv")
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 
-print(f"--- {MODULE} {PRESENTATIONS} ---")
-print(f"TIME CHECKPOINTS: {TIME_CHECKPOINTS}, WINDOW={WINDOW_DAYS} days")
 
-# =========================
-# 1) Filter students (self-paced)
-# =========================
-reg_filtered = student_reg[
-    (student_reg["code_module"] == MODULE)
-    & (student_reg["code_presentation"].isin(PRESENTATIONS))
-    & (student_reg["date_registration"] <= 0)
-]
-valid_ids = reg_filtered["id_student"].unique()
-
-students = student_info[
-    (student_info["code_module"] == MODULE)
-    & (student_info["code_presentation"].isin(PRESENTATIONS))
-    & (student_info["id_student"].isin(valid_ids))
-].copy()
-
-students["dropout"] = (students["final_result"] == "Withdrawn").astype(int)
-print("Unique students:", students["id_student"].nunique())
-
-# =========================
-# helper: inactivity streak within [start,end]
-# =========================
-def compute_inactivity_streak(days_list, start_day, end_day):
+def compute_inactivity_streak(days_list: List[int], start_day: int, end_day: int) -> int:
+    """Đếm số ngày cuối cùng không hoạt động trong đoạn [start_day, end_day]."""
     if not days_list:
         return end_day - start_day + 1
     active_set = set(days_list)
@@ -54,198 +49,235 @@ def compute_inactivity_streak(days_list, start_day, end_day):
         d -= 1
     return streak
 
-# =========================
-# 2) Build time-aware snapshots with extra features
-# =========================
-augmented = []
 
-for cutoff in TIME_CHECKPOINTS:
-    w_start = max(0, cutoff - (WINDOW_DAYS - 1))
-    w_end   = cutoff
-    w_mid   = max(w_start, w_end - (HALF_WINDOW - 1))  # last 7 days start
+def load_raw_data(data_dir: str) -> Dict[str, pd.DataFrame]:
+    data_dir = Path(data_dir)
+    return {
+        "student_info": pd.read_csv(data_dir / "studentInfo.csv"),
+        "student_reg": pd.read_csv(data_dir / "studentRegistration.csv"),
+        "student_vle": pd.read_csv(data_dir / "studentVle.csv"),
+        "student_ass": pd.read_csv(data_dir / "studentAssessment.csv"),
+        "assessments": pd.read_csv(data_dir / "assessments.csv"),
+    }
 
-    # ---- VLE cumulative up to cutoff
-    vle_cum = student_vle[
-        (student_vle["code_module"] == MODULE)
-        & (student_vle["code_presentation"].isin(PRESENTATIONS))
-        & (student_vle["id_student"].isin(students["id_student"]))
-        & (student_vle["date"] <= cutoff)
-    ].copy()
 
-    # ---- VLE sliding window (last 14 days)
-    vle_win = vle_cum[vle_cum["date"] >= w_start].copy()
-
-    # cumulative aggregation
-    cum_agg = (vle_cum.groupby("id_student")
-               .agg(total_clicks=("sum_click","sum"),
-                    active_days_total=("date","nunique"),
-                    last_active=("date","max"))
-               .reset_index())
-
-    cum_agg["days_elapsed_program"] = cutoff
-    cum_agg["clicks_per_day_total"] = cum_agg["total_clicks"] / max(cutoff, 1)
-    cum_agg["active_ratio_total"]   = cum_agg["active_days_total"] / max(cutoff, 1)
-    cum_agg["days_since_last_active"] = cutoff - cum_agg["last_active"]
-    cum_agg["avg_clicks_per_active_day_total"] = (
-        cum_agg["total_clicks"] / cum_agg["active_days_total"].replace(0, np.nan)
-    ).fillna(0)
-
-    # sliding window aggregation (14d)
-    win_agg = (vle_win.groupby("id_student")
-               .agg(clicks_last_14_days=("sum_click","sum"),
-                    active_days_14=("date","nunique"))
-               .reset_index())
-    win_agg["clicks_per_day_14"] = win_agg["clicks_last_14_days"] / WINDOW_DAYS
-    win_agg["active_ratio_14"]   = win_agg["active_days_14"] / WINDOW_DAYS
-
-    # 0-7 vs 8-14 inside the 14-day window (trend)
-    # define split: first half = [w_start, w_start+6], second half = [w_start+7, w_end]
-    first_end = min(w_end, w_start + (HALF_WINDOW - 1))
-    second_start = min(w_end, first_end + 1)
-
-    clicks_0_7 = (vle_win[(vle_win["date"] >= w_start) & (vle_win["date"] <= first_end)]
-                  .groupby("id_student")["sum_click"].sum()
-                  .reset_index(name="clicks_0_7"))
-    clicks_8_14 = (vle_win[(vle_win["date"] >= second_start) & (vle_win["date"] <= w_end)]
-                   .groupby("id_student")["sum_click"].sum()
-                   .reset_index(name="clicks_8_14"))
-
-    # last 7 days clicks (more “real-time”)
-    clicks_last_7 = (vle_cum[vle_cum["date"] > (cutoff - 7)]
-                     .groupby("id_student")["sum_click"].sum()
-                     .reset_index(name="clicks_last_7_days"))
-
-    # inactivity streak within window
-    days_list = (vle_win.groupby("id_student")["date"]
-                 .apply(lambda x: sorted(x.unique()))
-                 .reset_index()
-                 .rename(columns={"date": "active_days_list"}))
-    days_list["inactivity_streak_14"] = days_list["active_days_list"].apply(
-        lambda lst: compute_inactivity_streak(lst, w_start, w_end)
-    )
-    streak = days_list[["id_student", "inactivity_streak_14"]]
-
-    # ---- Assessment cumulative up to cutoff (FIX leakage module/presentation)
-    ass_cum = student_ass[
-        (student_ass["code_module"] == MODULE)
-        & (student_ass["code_presentation"].isin(PRESENTATIONS))
-        & (student_ass["id_student"].isin(students["id_student"]))
-        & (student_ass["date_submitted"].notna())
-        & (student_ass["date_submitted"] <= cutoff)
-    ].copy()
-
-    ass_agg = (ass_cum.groupby("id_student")
-               .agg(num_assessments=("id_assessment","nunique"),
-                    avg_score=("score","mean"),
-                    pass_count=("score", lambda x: (x >= 40).sum()),
-                    last_score=("score","last"))
-               .reset_index())
-
-    # assessment in last 14 days (optional but useful)
-    ass_win = ass_cum[ass_cum["date_submitted"] >= w_start]
-    ass_agg_14 = (ass_win.groupby("id_student")
-                  .agg(num_assessments_14=("id_assessment","nunique"),
-                       avg_score_14=("score","mean"))
-                  .reset_index())
-
-    # ---- merge all
-    base = students[["id_student", "dropout"]].copy()
-    merged = base.merge(cum_agg, on="id_student", how="left")
-    merged = merged.merge(win_agg, on="id_student", how="left")
-    merged = merged.merge(clicks_0_7, on="id_student", how="left")
-    merged = merged.merge(clicks_8_14, on="id_student", how="left")
-    merged = merged.merge(clicks_last_7, on="id_student", how="left")
-    merged = merged.merge(streak, on="id_student", how="left")
-    merged = merged.merge(ass_agg, on="id_student", how="left")
-    merged = merged.merge(ass_agg_14, on="id_student", how="left")
-
-    # fillna
-    fill0 = [
-        "total_clicks","active_days_total","last_active",
-        "clicks_last_14_days","active_days_14",
-        "clicks_0_7","clicks_8_14","clicks_last_7_days",
-        "inactivity_streak_14",
-        "num_assessments","avg_score","pass_count","last_score",
-        "num_assessments_14","avg_score_14"
+def filter_students(raw: Dict[str, pd.DataFrame], module: str, presentations: List[str]) -> pd.DataFrame:
+    reg_filtered = raw["student_reg"][
+        (raw["student_reg"]["code_module"] == module)
+        & (raw["student_reg"]["code_presentation"].isin(presentations))
+        & (raw["student_reg"]["date_registration"] <= 0)
     ]
-    for c in fill0:
-        merged[c] = merged[c].fillna(0)
+    valid_ids = reg_filtered["id_student"].unique()
 
-    # derived trend/ratios (add +1 to avoid /0)
-    merged["trend_click_14"] = merged["clicks_8_14"] - merged["clicks_0_7"]
-    merged["ratio_click_14"] = (merged["clicks_8_14"] + 1) / (merged["clicks_0_7"] + 1)
-
-    # re-assert context
-    merged["days_elapsed_program"] = cutoff
-
-    augmented.append(merged)
-
-final_df = pd.concat(augmented, ignore_index=True)
-print("Augmented shape:", final_df.shape)
-
-# =========================
-# Feature list (numeric only, production-friendly)
-# =========================
-feature_cols = [
-    # context
-    "days_elapsed_program",
-
-    # cumulative
-    "total_clicks",
-    "active_days_total",
-    "clicks_per_day_total",
-    "active_ratio_total",
-    "avg_clicks_per_active_day_total",
-    "days_since_last_active",
-
-    # sliding window 14d
-    "clicks_last_14_days",
-    "active_days_14",
-    "clicks_per_day_14",
-    "active_ratio_14",
-    "clicks_last_7_days",
-
-    # trend/streak
-    "clicks_0_7",
-    "clicks_8_14",
-    "trend_click_14",
-    "ratio_click_14",
-    "inactivity_streak_14",
-
-    # assessment
-    "num_assessments",
-    "avg_score",
-    "pass_count",
-    "last_score",
-    "num_assessments_14",
-    "avg_score_14",
-]
-
-X = final_df[feature_cols]
-y = final_df["dropout"].astype(int)
-groups = final_df["id_student"]
-
-print("Num features:", len(feature_cols))
+    students = raw["student_info"][
+        (raw["student_info"]["code_module"] == module)
+        & (raw["student_info"]["code_presentation"].isin(presentations))
+        & (raw["student_info"]["id_student"].isin(valid_ids))
+    ].copy()
+    students["dropout"] = (students["final_result"] == "Withdrawn").astype(int)
+    return students
 
 
-from sklearn.model_selection import GroupKFold
-from sklearn.feature_selection import VarianceThreshold
-from sklearn.preprocessing import PowerTransformer
+def build_features(
+    students: pd.DataFrame,
+    raw: Dict[str, pd.DataFrame],
+    module: str,
+    presentations: List[str],
+    time_checkpoints: List[int],
+    window_days: int = WINDOW_DAYS,
+    half_window: int = HALF_WINDOW,
+) -> Tuple[pd.DataFrame, List[str]]:
+    assessments = raw["assessments"]
+    target_assessment_ids = assessments.loc[
+        (assessments["code_module"] == module)
+        & (assessments["code_presentation"].isin(presentations)),
+        "id_assessment",
+    ].unique()
 
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.neural_network import MLPClassifier
-from sklearn.linear_model import LogisticRegression
+    augmented = []
+    for cutoff in time_checkpoints:
+        w_start = max(0, cutoff - (window_days - 1))
+        w_end = cutoff
 
-from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score, roc_curve
-import matplotlib.pyplot as plt
+        vle_cum = raw["student_vle"][
+            (raw["student_vle"]["code_module"] == module)
+            & (raw["student_vle"]["code_presentation"].isin(presentations))
+            & (raw["student_vle"]["id_student"].isin(students["id_student"]))
+            & (raw["student_vle"]["date"] <= cutoff)
+        ].copy()
 
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
-from sklearn.pipeline import Pipeline as SkPipeline
+        vle_win = vle_cum[vle_cum["date"] >= w_start].copy()
 
-# =========================
-# Models (hyperparams from your link)
-# =========================
+        cum_agg = (
+            vle_cum.groupby("id_student")
+            .agg(
+                total_clicks=("sum_click", "sum"),
+                active_days_total=("date", "nunique"),
+                last_active=("date", "max"),
+            )
+            .reset_index()
+        )
+        cum_agg["days_elapsed_program"] = cutoff
+        cum_agg["clicks_per_day_total"] = cum_agg["total_clicks"] / max(cutoff, 1)
+        cum_agg["active_ratio_total"] = cum_agg["active_days_total"] / max(cutoff, 1)
+        cum_agg["days_since_last_active"] = cutoff - cum_agg["last_active"]
+        cum_agg["avg_clicks_per_active_day_total"] = (
+            cum_agg["total_clicks"] / cum_agg["active_days_total"].replace(0, np.nan)
+        ).fillna(0)
+
+        win_agg = (
+            vle_win.groupby("id_student")
+            .agg(clicks_last_14_days=("sum_click", "sum"), active_days_14=("date", "nunique"))
+            .reset_index()
+        )
+        win_agg["clicks_per_day_14"] = win_agg["clicks_last_14_days"] / window_days
+        win_agg["active_ratio_14"] = win_agg["active_days_14"] / window_days
+
+        first_end = min(w_end, w_start + (half_window - 1))
+        second_start = min(w_end, first_end + 1)
+
+        clicks_0_7 = (
+            vle_win[(vle_win["date"] >= w_start) & (vle_win["date"] <= first_end)]
+            .groupby("id_student")["sum_click"]
+            .sum()
+            .reset_index(name="clicks_0_7")
+        )
+        clicks_8_14 = (
+            vle_win[(vle_win["date"] >= second_start) & (vle_win["date"] <= w_end)]
+            .groupby("id_student")["sum_click"]
+            .sum()
+            .reset_index(name="clicks_8_14")
+        )
+
+        clicks_last_7 = (
+            vle_cum[vle_cum["date"] > (cutoff - 7)]
+            .groupby("id_student")["sum_click"]
+            .sum()
+            .reset_index(name="clicks_last_7_days")
+        )
+
+        days_list = (
+            vle_win.groupby("id_student")["date"]
+            .apply(lambda x: sorted(x.unique()))
+            .reset_index()
+            .rename(columns={"date": "active_days_list"})
+        )
+        days_list["inactivity_streak_14"] = days_list["active_days_list"].apply(
+            lambda lst: compute_inactivity_streak(lst, w_start, w_end)
+        )
+        streak = days_list[["id_student", "inactivity_streak_14"]]
+
+        ass_cum = raw["student_ass"][
+            (raw["student_ass"]["id_assessment"].isin(target_assessment_ids))
+            & (raw["student_ass"]["id_student"].isin(students["id_student"]))
+            & (raw["student_ass"]["date_submitted"].notna())
+            & (raw["student_ass"]["date_submitted"] <= cutoff)
+        ].copy()
+
+        ass_agg = (
+            ass_cum.groupby("id_student")
+            .agg(
+                num_assessments=("id_assessment", "nunique"),
+                avg_score=("score", "mean"),
+                pass_count=("score", lambda x: (x >= 40).sum()),
+                last_score=("score", "last"),
+            )
+            .reset_index()
+        )
+
+        ass_win = ass_cum[ass_cum["date_submitted"] >= w_start]
+        ass_agg_14 = (
+            ass_win.groupby("id_student")
+            .agg(num_assessments_14=("id_assessment", "nunique"), avg_score_14=("score", "mean"))
+            .reset_index()
+        )
+
+        base = students[["id_student", "dropout"]].copy()
+        merged = base.merge(cum_agg, on="id_student", how="left")
+        merged = merged.merge(win_agg, on="id_student", how="left")
+        merged = merged.merge(clicks_0_7, on="id_student", how="left")
+        merged = merged.merge(clicks_8_14, on="id_student", how="left")
+        merged = merged.merge(clicks_last_7, on="id_student", how="left")
+        merged = merged.merge(streak, on="id_student", how="left")
+        merged = merged.merge(ass_agg, on="id_student", how="left")
+        merged = merged.merge(ass_agg_14, on="id_student", how="left")
+
+        fill0 = [
+            "total_clicks",
+            "active_days_total",
+            "last_active",
+            "clicks_last_14_days",
+            "active_days_14",
+            "clicks_0_7",
+            "clicks_8_14",
+            "clicks_last_7_days",
+            "inactivity_streak_14",
+            "num_assessments",
+            "avg_score",
+            "pass_count",
+            "last_score",
+            "num_assessments_14",
+            "avg_score_14",
+        ]
+        for col in fill0:
+            merged[col] = merged[col].fillna(0)
+
+        merged["trend_click_14"] = merged["clicks_8_14"] - merged["clicks_0_7"]
+        merged["ratio_click_14"] = (merged["clicks_8_14"] + 1) / (merged["clicks_0_7"] + 1)
+        merged["days_elapsed_program"] = cutoff
+
+        augmented.append(merged)
+
+    final_df = pd.concat(augmented, ignore_index=True)
+
+    feature_cols = [
+        "days_elapsed_program",
+        "clicks_per_day_total",
+        "active_ratio_total",
+        "avg_clicks_per_active_day_total",
+        "days_since_last_active",
+        "clicks_last_14_days",
+        "active_days_14",
+        "clicks_per_day_14",
+        "active_ratio_14",
+        "clicks_last_7_days",
+        "clicks_0_7",
+        "clicks_8_14",
+        "trend_click_14",
+        "ratio_click_14",
+        "inactivity_streak_14",
+        "num_assessments",
+        "avg_score",
+        "pass_count",
+        "last_score",
+        "num_assessments_14",
+        "avg_score_14",
+    ]
+
+    return final_df, feature_cols
+
+
+def make_eval_pipe(model):
+    return ImbPipeline(
+        [
+            ("variance_threshold", VarianceThreshold(VAR_THRESH)),
+            ("smote", SMOTE()),
+            ("power_transformer", PowerTransformer()),
+            ("classifier", model),
+        ]
+    )
+
+
+def make_prod_pipe(model):
+    return SkPipeline(
+        [
+            ("variance_threshold", VarianceThreshold(VAR_THRESH)),
+            ("power_transformer", PowerTransformer()),
+            ("classifier", model),
+        ]
+    )
+
+
 MODELS = {
     "GradientBoostingClassifier": GradientBoostingClassifier(
         learning_rate=0.03,
@@ -255,7 +287,7 @@ MODELS = {
         min_samples_split=20,
         n_estimators=10,
         n_iter_no_change=10,
-        random_state=42
+        random_state=42,
     ),
     "RandomForestClassifier": RandomForestClassifier(
         criterion="gini",
@@ -264,7 +296,7 @@ MODELS = {
         min_samples_split=50,
         n_estimators=50,
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
     ),
     "MLPClassifier": MLPClassifier(
         alpha=0.1,
@@ -275,177 +307,138 @@ MODELS = {
         max_iter=1200,
         momentum=0.9,
         solver="sgd",
-        random_state=42
+        random_state=42,
     ),
     "LogisticRegression": LogisticRegression(
         penalty="l1",
         solver="saga",
         tol=1e-4,
         max_iter=2000,
-        random_state=42
-    )
+        random_state=42,
+    ),
 }
 
-# =========================
-# Pipelines: eval vs production
-# =========================
-VAR_THRESH = 0.0  # production-safe; 3 can drop too many columns with small feature set
 
-def make_eval_pipe(model):
-    # Like notebook: VarianceThreshold + SMOTE + PowerTransformer + classifier
-    return ImbPipeline([
-        ("variance_threshold", VarianceThreshold(VAR_THRESH)),
-        ("smote", SMOTE()),
-        ("power_transformer", PowerTransformer()),
-        ("classifier", model),
-    ])
+def evaluate_models(X: pd.DataFrame, y: pd.Series, groups: pd.Series) -> pd.DataFrame:
+    gkf = GroupKFold(n_splits=5)
+    summary_rows = []
 
-def make_prod_pipe(model):
-    # Production: NO SMOTE
-    return SkPipeline([
-        ("variance_threshold", VarianceThreshold(VAR_THRESH)),
-        ("power_transformer", PowerTransformer()),
-        ("classifier", model),
-    ])
+    for name, model in MODELS.items():
+        rows = []
+        for fold, (tr_idx, te_idx) in enumerate(gkf.split(X, y, groups), start=1):
+            X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
+            y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
 
-# =========================
-# GroupKFold evaluation + ROC curves
-# =========================
-gkf = GroupKFold(n_splits=5)
-mean_fpr = np.linspace(0, 1, 200)
+            pipe = make_eval_pipe(model)
+            pipe.fit(X_tr, y_tr)
 
-summary_rows = []
-roc_by_model = {}
+            y_pred = pipe.predict(X_te)
+            y_proba = pipe.predict_proba(X_te)[:, 1]
 
-for name, model in MODELS.items():
-    rows = []
-    tprs = []
+            rows.append(
+                {
+                    "model": name,
+                    "fold": fold,
+                    "accuracy": accuracy_score(y_te, y_pred),
+                    "f1": f1_score(y_te, y_pred),
+                    "sensitivity": recall_score(y_te, y_pred),
+                    "specificity": recall_score(y_te, y_pred, pos_label=0),
+                    "auc": roc_auc_score(y_te, y_proba),
+                }
+            )
 
-    for fold, (tr_idx, te_idx) in enumerate(gkf.split(X, y, groups), start=1):
-        X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
-        y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
+        df = pd.DataFrame(rows)
+        summary_rows.append(
+            {
+                "model": name,
+                "mean_accuracy": df["accuracy"].mean(),
+                "mean_f1": df["f1"].mean(),
+                "mean_sensitivity": df["sensitivity"].mean(),
+                "mean_specificity": df["specificity"].mean(),
+                "mean_auc": df["auc"].mean(),
+            }
+        )
 
-        pipe = make_eval_pipe(model)
-        pipe.fit(X_tr, y_tr)
+    summary_df = pd.DataFrame(summary_rows).sort_values("mean_f1", ascending=False)
+    logging.info("Hiệu năng trung bình (sort theo F1):\n%s", summary_df)
+    return summary_df
 
-        y_pred = pipe.predict(X_te)
-        y_proba = pipe.predict_proba(X_te)[:, 1]
 
-        acc = accuracy_score(y_te, y_pred)
-        f1  = f1_score(y_te, y_pred)
-        sens = recall_score(y_te, y_pred)
-        spec = recall_score(y_te, y_pred, pos_label=0)
-        auc = roc_auc_score(y_te, y_proba)
+def train_and_save(final_df: pd.DataFrame, feature_cols: List[str], model_path: str) -> str:
+    X = final_df[feature_cols].fillna(0)
+    y = final_df["dropout"].astype(int)
+    groups = final_df["id_student"]
 
-        rows.append({"model": name, "fold": fold, "accuracy": acc, "f1": f1, "sensitivity": sens, "specificity": spec, "auc": auc})
+    summary_df = evaluate_models(X, y, groups)
+    best_model_name = summary_df.iloc[0]["model"]
+    logging.info("Chọn model tốt nhất: %s", best_model_name)
 
-        fpr, tpr, _ = roc_curve(y_te, y_proba)
-        tprs.append(np.interp(mean_fpr, fpr, tpr))
-        tprs[-1][0] = 0.0
+    final_model = MODELS[best_model_name]
+    pipeline = make_prod_pipe(final_model)
+    pipeline.fit(X, y)
+    joblib.dump(pipeline, model_path)
+    logging.info("Đã lưu model vào %s", model_path)
+    return best_model_name
 
-    df = pd.DataFrame(rows)
-    summary_rows.append({
-        "model": name,
-        "mean_accuracy": df["accuracy"].mean(),
-        "mean_f1": df["f1"].mean(),
-        "mean_sensitivity": df["sensitivity"].mean(),
-        "mean_specificity": df["specificity"].mean(),
-        "mean_auc": df["auc"].mean(),
-    })
 
-    mean_tpr = np.mean(tprs, axis=0)
-    mean_tpr[-1] = 1.0
-    roc_by_model[name] = mean_tpr
+def predict_dropout(
+    model_path: str,
+    students: pd.DataFrame,
+    raw: Dict[str, pd.DataFrame],
+    cutoff_day: int,
+    module: str,
+    presentations: List[str],
+) -> pd.DataFrame:
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"Không tìm thấy model: {model_path}")
 
-summary_df = pd.DataFrame(summary_rows).sort_values("mean_f1", ascending=False)
-display(summary_df)
+    pipeline = joblib.load(model_path)
+    final_df, feature_cols = build_features(
+        students=students,
+        raw=raw,
+        module=module,
+        presentations=presentations,
+        time_checkpoints=[cutoff_day],
+    )
+    X_today = final_df[feature_cols].fillna(0)
+    proba = pipeline.predict_proba(X_today)[:, 1]
+    out = final_df[["id_student", "dropout"]].copy()
+    out["dropout_proba"] = proba
+    out["days_elapsed_program"] = cutoff_day
+    return out.sort_values("dropout_proba", ascending=False)
 
-best_model_name = summary_df.iloc[0]["model"]
-print("Best model by mean F1:", best_model_name)
 
-# =========================
-# Plot ROC curves (mean across folds)
-# =========================
-plt.figure(figsize=(8, 6))
-for name, mean_tpr in roc_by_model.items():
-    plt.plot(mean_fpr, mean_tpr, label=name)
-plt.plot([0,1], [0,1], linestyle="--", linewidth=1)
-plt.title("Mean ROC curve (5-fold GroupKFold)")
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.legend()
-plt.tight_layout()
-plt.show()
+def send_email_stub(student_row: pd.Series) -> None:
+    """Placeholder: thay bằng SMTP/Mail service thực tế."""
+    logging.info(
+        "[EMAIL] Gửi cảnh báo tới học viên %s, xác suất bỏ học=%.2f",
+        student_row["id_student"],
+        student_row["dropout_proba"],
+    )
 
-# =========================
-# Bar chart for mean F1 and mean AUC
-# =========================
-plt.figure(figsize=(8, 5))
-plt.bar(summary_df["model"], summary_df["mean_f1"])
-plt.title("Mean F1 by Model (5-fold GroupKFold)")
-plt.ylabel("Mean F1")
-plt.xticks(rotation=20, ha="right")
-plt.tight_layout()
-plt.show()
 
-plt.figure(figsize=(8, 5))
-plt.bar(summary_df["model"], summary_df["mean_auc"])
-plt.title("Mean AUC by Model (5-fold GroupKFold)")
-plt.ylabel("Mean AUC")
-plt.xticks(rotation=20, ha="right")
-plt.tight_layout()
-plt.show()
+def daily_job(threshold: float = 0.5, cutoff_day: int = 60) -> None:
+    raw = load_raw_data(DATA_DIR)
+    students = filter_students(raw, MODULE, PRESENTATIONS)
+    alerts = predict_dropout(MODEL_PATH, students, raw, cutoff_day, MODULE, PRESENTATIONS)
+    need_alert = alerts[alerts["dropout_proba"] >= threshold]
+    for _, row in need_alert.iterrows():
+        send_email_stub(row)
+    logging.info("Đã xử lý %d học viên, gửi %d cảnh báo", len(alerts), len(need_alert))
 
-# =========================
-# Train FINAL production model (NO SMOTE) for cron inference
-# =========================
-best_model = MODELS[best_model_name]
-final_pipeline = make_prod_pipe(best_model)
-final_pipeline.fit(X, y)
 
-# Simple production threshold
-# (Bạn có thể hạ 0.5 xuống 0.35 nếu muốn nhạy hơn cảnh báo)
-PROD_THRESHOLD = 0.5
+def train_pipeline() -> None:
+    logging.info("Bắt đầu load dữ liệu và train...")
+    raw = load_raw_data(DATA_DIR)
+    students = filter_students(raw, MODULE, PRESENTATIONS)
+    logging.info("Số học viên hợp lệ: %d", students["id_student"].nunique())
+    final_df, feature_cols = build_features(students, raw, MODULE, PRESENTATIONS, TIME_CHECKPOINTS)
+    logging.info("Dataset augmented: %s", final_df.shape)
+    best_model = train_and_save(final_df, feature_cols, MODEL_PATH)
+    logging.info("Hoàn tất train, best model: %s", best_model)
 
-def predict_dropout_risk(feature_row_df: pd.DataFrame) -> dict:
-    proba = float(final_pipeline.predict_proba(feature_row_df)[0, 1])
-    label = int(proba >= PROD_THRESHOLD)
-    return {"risk_prob": proba, "risk_label": label, "threshold": PROD_THRESHOLD}
 
-# Example for cron
-sample = pd.DataFrame([{
-    # context
-    "days_elapsed_program": 45,
-
-    # cumulative
-    "total_clicks": 120,
-    "active_days_total": 10,
-    "clicks_per_day_total": 120/45,
-    "active_ratio_total": 10/45,
-    "avg_clicks_per_active_day_total": 120/10,
-    "days_since_last_active": 5,
-
-    # 14d window
-    "clicks_last_14_days": 15,
-    "active_days_14": 3,
-    "clicks_per_day_14": 15/14,
-    "active_ratio_14": 3/14,
-    "clicks_last_7_days": 2,
-
-    # trend
-    "clicks_0_7": 13,
-    "clicks_8_14": 2,
-    "trend_click_14": 2 - 13,
-    "ratio_click_14": (2+1)/(13+1),
-    "inactivity_streak_14": 5,
-
-    # assessment
-    "num_assessments": 1,
-    "avg_score": 80,
-    "pass_count": 1,
-    "last_score": 80,
-    "num_assessments_14": 1,
-    "avg_score_14": 80,
-}])
-
-print("Cron simulation:", predict_dropout_risk(sample))
+if __name__ == "__main__":
+    # Chạy train một lần để tạo model phục vụ cron.
+    train_pipeline()
+    # Ví dụ chạy cron hằng ngày: daily_job(threshold=0.45, cutoff_day=120)
