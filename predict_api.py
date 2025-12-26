@@ -389,6 +389,8 @@ def predict_with_precomputed_features(students_features: List[StudentFeatures]):
     if model is None:
         raise HTTPException(status_code=500, detail="Model chưa được load")
     
+    logger.info(f"📥 Nhận request predict cho {len(students_features)} học viên")
+    
     try:
         # Chuyển features thành DataFrame
         feature_cols = [
@@ -434,8 +436,19 @@ def predict_with_precomputed_features(students_features: List[StudentFeatures]):
         
         X = pd.DataFrame(features_list)[feature_cols].fillna(0)
         
+        # Log features của từng student
+        for idx, (student_id, features) in enumerate(zip(student_ids, features_list)):
+            logger.info(f"\n👤 Student {student_id}:")
+            logger.info(f"   days_elapsed: {features['days_elapsed_since_reg']}")
+            logger.info(f"   clicks_14d: {features['clicks_last_14_days']}, active_days_14: {features['active_days_14']}")
+            logger.info(f"   active_ratio_14: {features['active_ratio_14']:.2%}")
+            logger.info(f"   inactivity_streak: {features['inactivity_streak_14']}")
+            logger.info(f"   trend: {features['trend_click_14']}, ratio: {features['ratio_click_14']:.2f}")
+        
         # Dự đoán batch
         dropout_probas = model.predict_proba(X)[:, 1]
+        
+        logger.info("\n🎯 Kết quả prediction:")
         
         # Tạo kết quả
         results = []
@@ -447,13 +460,15 @@ def predict_with_precomputed_features(students_features: List[StudentFeatures]):
             else:
                 risk_level = "HIGH"
             
+            logger.info(f"   {student_id}: {proba:.1%} ({risk_level})")
+            
             results.append(BatchPredictionResponse(
                 student_id=student_id,
                 dropout_probability=float(proba),
                 risk_level=risk_level
             ))
         
-        logger.info(f"Batch prediction hoàn thành cho {len(students_features)} học viên")
+        logger.info(f"\n✅ Batch prediction hoàn thành cho {len(students_features)} học viên")
         return results
         
     except Exception as e:
