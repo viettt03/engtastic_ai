@@ -362,27 +362,23 @@ preprocessor = ColumnTransformer(
 # 9. MODELS
 # =========================================================
 models = {
-    # Logistic Regression: Thêm class_weight='balanced'
     "LogisticRegression": LogisticRegression(
-        penalty="l2",         # Đổi sang l2 thường ổn định hơn cho dữ liệu ít feature
+        penalty="l2",        
         solver="lbfgs",
-        class_weight="balanced", # <--- QUAN TRỌNG: Cân bằng trọng số lớp
+        class_weight="balanced",
         max_iter=2000,
     ),
     
-    # RandomForest: Tăng độ sâu và số cây, thêm class_weight
     "RandomForest": RandomForestClassifier(
         criterion="gini",
-        n_estimators=200,      # Tăng từ 50 lên 200
-        max_depth=10,          # Tăng từ 3 lên 10 (hoặc None) để học sâu hơn
-        min_samples_leaf=4,    # Giảm từ 10 xuống 4 để bắt pattern nhỏ hơn
+        n_estimators=200,     
+        max_depth=10,         
+        min_samples_leaf=4,    
         min_samples_split=10,  # Giảm từ 50 xuống 10
         class_weight="balanced", # <--- QUAN TRỌNG
         random_state=42
     ),
     
-    # GradientBoosting: Tăng mạnh n_estimators (GB ko có class_weight trực tiếp, phải chỉnh mẫu hoặc dùng XGBoost/LGBM)
-    # Nhưng ta sẽ chỉnh learning rate và số cây để nó học kỹ hơn
     "GradientBoosting": GradientBoostingClassifier(
         learning_rate=0.05,    # Tăng nhẹ hoặc giữ nguyên
         n_estimators=150,      # Tăng từ 10 lên 150 (10 là quá ít)

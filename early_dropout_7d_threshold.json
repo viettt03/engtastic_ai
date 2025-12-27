@@ -1,0 +1,19 @@
+{
+  "cutoff_days": 7,
+  "threshold": 0.5057544742966805,
+  "target_recall": 0.8,
+  "model_name": "RandomForest",
+  "feature_cols": [
+    "days_elapsed_since_reg",
+    "clicks_per_day_total",
+    "active_ratio_total",
+    "avg_clicks_per_active_day_total",
+    "days_since_last_active",
+    "clicks_last_3_days",
+    "clicks_0_3",
+    "clicks_4_7",
+    "trend_click_7",
+    "ratio_click_7",
+    "inactivity_streak_7"
+  ]
+}

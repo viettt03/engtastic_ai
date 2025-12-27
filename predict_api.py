@@ -24,7 +24,7 @@ app = FastAPI(
 )
 
 # Load model
-MODEL_PATH = "dropout_model_relative.pkl"
+MODEL_PATH = "short_term_warning_model.pkl"
 try:
     model = joblib.load(MODEL_PATH)
     logger.info(f"Đã load model từ {MODEL_PATH}")
