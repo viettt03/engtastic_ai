@@ -24,7 +24,7 @@ app = FastAPI(
 )
 
 # Load model
-MODEL_PATH = "short_term_inactive_next7days_logreg.pkl"
+MODEL_PATH = "short_term_inactive_next14days.bundle.pkl"
 try:
     model_bundle = joblib.load(MODEL_PATH)
     # Model được lưu dưới dạng dictionary {"pipeline": ..., "feature_cols": ...}
