@@ -24,13 +24,19 @@ app = FastAPI(
 )
 
 # Load model
-MODEL_PATH = "short_term_warning_model.pkl"
+MODEL_PATH = "short_term_inactive_next7days_logreg.pkl"
 try:
-    model = joblib.load(MODEL_PATH)
+    model_bundle = joblib.load(MODEL_PATH)
+    # Model được lưu dưới dạng dictionary {"pipeline": ..., "feature_cols": ...}
+    model = model_bundle["pipeline"] if isinstance(model_bundle, dict) else model_bundle
+    model_feature_cols = model_bundle.get("feature_cols") if isinstance(model_bundle, dict) else None
     logger.info(f"Đã load model từ {MODEL_PATH}")
+    if model_feature_cols:
+        logger.info(f"Model features: {model_feature_cols}")
 except Exception as e:
     logger.error(f"Không thể load model: {e}")
     model = None
+    model_feature_cols = None
 
 # Cấu hình
 WINDOW_DAYS = 14
@@ -281,7 +287,7 @@ def predict_dropout(student_data: StudentData):
         logger.info(f"Đã tính toán features cho student {student_data.student_id}")
         
         # Chuyển features thành DataFrame với đúng thứ tự cột
-        feature_cols = [
+        feature_cols = model_feature_cols or [
             "days_elapsed_since_reg",
             "clicks_per_day_total",
             "active_ratio_total",
@@ -301,7 +307,7 @@ def predict_dropout(student_data: StudentData):
         
         X = pd.DataFrame([features])[feature_cols].fillna(0)
         
-        # Dự đoán
+        # Dự đoán với pipeline object
         dropout_proba = model.predict_proba(X)[0, 1]
         
         # Xác định mức độ rủi ro
@@ -393,7 +399,7 @@ def predict_with_precomputed_features(students_features: List[StudentFeatures]):
     
     try:
         # Chuyển features thành DataFrame
-        feature_cols = [
+        feature_cols = model_feature_cols or [
             "days_elapsed_since_reg",
             "clicks_per_day_total",
             "active_ratio_total",
