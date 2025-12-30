@@ -24,7 +24,7 @@ app = FastAPI(
 )
 
 # Load model
-MODEL_PATH = "short_term_inactive_next14days.bundle.pkl"
+MODEL_PATH = "short_term_inactive_next7days_logreg.pkl"
 try:
     model_bundle = joblib.load(MODEL_PATH)
     # Model được lưu dưới dạng dictionary {"pipeline": ..., "feature_cols": ...}
@@ -459,7 +459,7 @@ def predict_with_precomputed_features(students_features: List[StudentFeatures]):
         # Tạo kết quả
         results = []
         for student_id, proba in zip(student_ids, dropout_probas):
-            if proba < 0.3:
+            if proba < 0.35:
                 risk_level = "LOW"
             elif proba < 0.6:
                 risk_level = "MEDIUM"
