@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r api_requirements.txt
 COPY predict_api.py .
 
 # Copy the trained model
-COPY dropout_model_relative.pkl .
+COPY short_term_inactive_next7days_logreg.pkl .
 
 # Expose the FastAPI port
 EXPOSE 8000
