@@ -12,7 +12,7 @@ services:
     restart: always
     environment:
       - PYTHONUNBUFFERED=1
-      - MODEL_PATH=/app/dropout_model_relative.pkl
+      - MODEL_PATH=/app/short_term_inactive_next7days_logreg.pkl
     healthcheck:
       test:
         [
